@@ -29,7 +29,7 @@ cd "$DOC_DIR"
 
 # Check if mdbook is installed
 if ! command -v mdbook &> /dev/null; then
-    echo "Error: mdbook is not installed."
+    echo "Error: mdbook is not installed yet."
     echo "Install it with: cargo install mdbook"
     exit 1
 fi
