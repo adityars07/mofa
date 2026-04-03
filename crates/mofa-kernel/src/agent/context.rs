@@ -63,7 +63,7 @@ use tokio::sync::{RwLock, mpsc};
 /// let value: Option<String> = ctx.get("user_id").await;
 /// ```
 #[derive(Clone)]
-pub struct AgentContext {
+pub struct AgentContext<S: Clone = serde_json::Value> {
     /// 执行 ID (唯一标识本次执行)
     /// Execution ID (unique identifier for this execution)
     pub execution_id: String,
@@ -72,25 +72,25 @@ pub struct AgentContext {
     pub session_id: Option<String>,
     /// 父上下文 (用于层级执行)
     /// Parent context (used for hierarchical execution)
-    parent: Option<Arc<AgentContext>>,
+    parent: Option<Arc<AgentContext<S>>>,
     /// 共享状态 (通用键值存储)
     /// Shared state (general key-value storage)
-    state: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    state: Arc<RwLock<HashMap<String, S>>>,
     /// 中断信号
     /// Interrupt signal
     interrupt: Arc<InterruptSignal>,
     /// 事件总线
     /// Event bus
-    event_bus: Arc<EventBus>,
+    event_bus: Arc<EventBus<S>>,
     /// 配置
     /// Configuration
-    config: Arc<ContextConfig>,
+    config: Arc<ContextConfig<S>>,
 }
 
 /// 上下文配置
 /// Context Configuration
-#[derive(Debug, Clone, Default)]
-pub struct ContextConfig {
+#[derive(Debug, Clone)]
+pub struct ContextConfig<S = serde_json::Value> {
     /// 超时时间 (毫秒)
     /// Timeout duration (milliseconds)
     pub timeout_ms: Option<u64>,
@@ -102,10 +102,24 @@ pub struct ContextConfig {
     pub enable_tracing: bool,
     /// 自定义配置
     /// Custom configuration
-    pub custom: HashMap<String, serde_json::Value>,
+    pub custom: HashMap<String, S>,
 }
 
-impl AgentContext {
+impl<S> Default for ContextConfig<S> {
+    fn default() -> Self {
+        Self {
+            timeout_ms: None,
+            max_retries: 3,
+            enable_tracing: false,
+            custom: HashMap::new(),
+        }
+    }
+}
+
+impl<S> AgentContext<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     /// 创建新的上下文
     /// Create a new context
     pub fn new(execution_id: impl Into<String>) -> Self {
@@ -146,32 +160,28 @@ impl AgentContext {
 
     /// 设置配置
     /// Set configuration
-    pub fn with_config(mut self, config: ContextConfig) -> Self {
+    pub fn with_config(mut self, config: ContextConfig<S>) -> Self {
         self.config = Arc::new(config);
         self
     }
 
     /// 获取值
     /// Get a value
-    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+    pub async fn get(&self, key: &str) -> Option<S> {
         let state = self.state.read().await;
-        state
-            .get(key)
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        state.get(key).cloned()
     }
 
     /// 设置值
     /// Set a value
-    pub async fn set<T: Serialize>(&self, key: &str, value: T) {
-        if let Ok(v) = serde_json::to_value(value) {
-            let mut state = self.state.write().await;
-            state.insert(key.to_string(), v);
-        }
+    pub async fn set(&self, key: &str, value: S) {
+        let mut state = self.state.write().await;
+        state.insert(key.to_string(), value);
     }
 
     /// 删除值
     /// Remove a value
-    pub async fn remove(&self, key: &str) -> Option<serde_json::Value> {
+    pub async fn remove(&self, key: &str) -> Option<S> {
         let mut state = self.state.write().await;
         state.remove(key)
     }
@@ -210,41 +220,41 @@ impl AgentContext {
 
     /// 获取配置
     /// Get configuration
-    pub fn config(&self) -> &ContextConfig {
+    pub fn config(&self) -> &ContextConfig<S> {
         &self.config
     }
 
     /// 获取父上下文
     /// Get parent context
-    pub fn parent(&self) -> Option<&Arc<AgentContext>> {
+    pub fn parent(&self) -> Option<&Arc<AgentContext<S>>> {
         self.parent.as_ref()
     }
 
     /// 发送事件
     /// Emit an event
-    pub async fn emit_event(&self, event: AgentEvent) {
+    pub async fn emit_event(&self, event: AgentEvent<S>) {
         self.event_bus.emit(event).await;
     }
 
     /// 订阅事件
     /// Subscribe to events
-    pub async fn subscribe(&self, event_type: &str) -> EventReceiver {
+    pub async fn subscribe(&self, event_type: &str) -> EventReceiver<S> {
         self.event_bus.subscribe(event_type).await
     }
 
     /// 从父上下文查找值 (递归向上查找)
     /// Find value from parent context (recursive lookup)
-    pub async fn find<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+    pub async fn find(&self, key: &str) -> Option<S> {
         // 先在当前上下文查找
         // Check current context first
-        if let Some(value) = self.get::<T>(key).await {
+        if let Some(value) = self.get(key).await {
             return Some(value);
         }
 
         // 递归查找父上下文
         // Recursively look up parent context
         if let Some(parent) = &self.parent {
-            return Box::pin(parent.find::<T>(key)).await;
+            return Box::pin(parent.find(key)).await;
         }
 
         None
@@ -304,13 +314,13 @@ impl Default for InterruptSignal {
 /// Agent 事件
 /// Agent Event
 #[derive(Debug, Clone)]
-pub struct AgentEvent {
+pub struct AgentEvent<S = serde_json::Value> {
     /// 事件类型
     /// Event type
     pub event_type: String,
     /// 事件数据
     /// Event data
-    pub data: serde_json::Value,
+    pub data: S,
     /// 时间戳
     /// Timestamp
     pub timestamp_ms: u64,
@@ -319,14 +329,10 @@ pub struct AgentEvent {
     pub source: Option<String>,
 }
 
-impl AgentEvent {
-    /// 创建新事件
+impl<S> AgentEvent<S> {
     /// Create a new event
-    pub fn new(event_type: impl Into<String>, data: serde_json::Value) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+    pub fn new(event_type: impl Into<String>, data: S) -> Self {
+        let now = crate::utils::now_ms();
 
         Self {
             event_type: event_type.into(),
@@ -346,15 +352,15 @@ impl AgentEvent {
 
 /// 事件接收器
 /// Event Receiver
-pub type EventReceiver = mpsc::Receiver<AgentEvent>;
+pub type EventReceiver<S = serde_json::Value> = tokio::sync::mpsc::Receiver<AgentEvent<S>>;
 
 /// 事件总线
 /// Event Bus
-pub struct EventBus {
-    subscribers: RwLock<HashMap<String, Vec<mpsc::Sender<AgentEvent>>>>,
+pub struct EventBus<S = serde_json::Value> {
+    subscribers: RwLock<HashMap<String, Vec<mpsc::Sender<AgentEvent<S>>>>>,
 }
 
-impl EventBus {
+impl<S: Send + Sync + 'static + Clone> EventBus<S> {
     /// 创建新的事件总线
     /// Create a new event bus
     pub fn new() -> Self {
@@ -364,31 +370,33 @@ impl EventBus {
     }
 
     /// 发送事件
-    /// Emit an event
-    pub async fn emit(&self, event: AgentEvent) {
-        let subscribers = self.subscribers.read().await;
-
-        // 发送给类型特定订阅者
-        // Send to type-specific subscribers
-        if let Some(senders) = subscribers.get(&event.event_type) {
-            for sender in senders {
-                let _ = sender.send(event.clone()).await;
+    /// Emit an event to all subscribers, pruning dead (closed) senders.
+    pub async fn emit(&self, event: AgentEvent<S>) {
+        // Collect live senders under a brief write lock, pruning any closed
+        // (dropped) receivers at the same time. The lock is released before
+        // any `.await` so that concurrent `subscribe()` callers are never
+        // starved.
+        let snapshot: Vec<mpsc::Sender<AgentEvent<S>>> = {
+            let mut subscribers = self.subscribers.write().await;
+            let mut live = Vec::new();
+            for key in [event.event_type.as_str(), "*"] {
+                if let Some(senders) = subscribers.get_mut(key) {
+                    senders.retain(|tx| !tx.is_closed());
+                    live.extend(senders.iter().cloned());
+                }
             }
-        }
+            live
+        }; // write lock released here, before any .await
 
-        // 发送给通配订阅者
-        // Send to wildcard subscribers
-        if let Some(senders) = subscribers.get("*") {
-            for sender in senders {
-                let _ = sender.send(event.clone()).await;
-            }
+        for sender in &snapshot {
+            let _ = sender.send(event.clone()).await;
         }
     }
 
     /// 订阅事件
     /// Subscribe to events
-    pub async fn subscribe(&self, event_type: &str) -> EventReceiver {
-        let (tx, rx) = mpsc::channel(100);
+    pub async fn subscribe(&self, event_type: &str) -> EventReceiver<S> {
+        let (tx, rx) = mpsc::channel::<AgentEvent<S>>(100);
         let mut subscribers = self.subscribers.write().await;
         subscribers
             .entry(event_type.to_string())
@@ -412,9 +420,9 @@ mod tests {
     async fn test_context_basic() {
         /// 测试上下文基本功能
         /// Test basic context functionality
-        let ctx = AgentContext::new("test-execution");
+        let ctx = AgentContext::<String>::new("test-execution");
 
-        ctx.set("key1", "value1").await;
+        ctx.set("key1", "value1".to_string()).await;
         let value: Option<String> = ctx.get("key1").await;
         assert_eq!(value, Some("value1".to_string()));
     }
@@ -423,11 +431,11 @@ mod tests {
     async fn test_context_child() {
         /// 测试子上下文
         /// Test child context
-        let parent = AgentContext::new("parent");
-        parent.set("parent_key", "parent_value").await;
+        let parent = AgentContext::<String>::new("parent");
+        parent.set("parent_key", "parent_value".to_string()).await;
 
         let child = parent.child("child");
-        child.set("child_key", "child_value").await;
+        child.set("child_key", "child_value".to_string()).await;
 
         // 子上下文可以访问自己的值
         // Child context can access its own values
@@ -444,7 +452,7 @@ mod tests {
     async fn test_interrupt_signal() {
         /// 测试中断信号
         /// Test interrupt signal
-        let ctx = AgentContext::new("test");
+        let ctx = AgentContext::<String>::new("test");
 
         assert!(!ctx.is_interrupted());
         ctx.trigger_interrupt();
@@ -457,17 +465,91 @@ mod tests {
     async fn test_event_bus() {
         /// 测试事件总线
         /// Test event bus
-        let ctx = AgentContext::new("test");
+        let ctx = AgentContext::<String>::new("test");
 
         let mut rx = ctx.subscribe("test_event").await;
 
-        ctx.emit_event(AgentEvent::new(
-            "test_event",
-            serde_json::json!({"msg": "hello"}),
-        ))
-        .await;
+        ctx.emit_event(AgentEvent::<String>::new("test_event", "hello".to_string()))
+            .await;
 
-        let event = rx.recv().await.unwrap();
+        let event = rx.recv().await.expect("failed");
         assert_eq!(event.event_type, "test_event");
+    }
+
+    /// Dead senders (from dropped receivers) must be pruned from the
+    /// subscribers Vec on the next `emit()` call so that memory does not
+    /// grow without bound and sends do not block on closed channels.
+    #[tokio::test]
+    async fn test_event_bus_dead_sender_pruned_on_emit() {
+        let bus = EventBus::new();
+
+        // Subscribe twice and immediately drop both receivers.
+        let _rx1 = bus.subscribe("ping").await;
+        let _rx2 = bus.subscribe("ping").await;
+        drop(_rx1);
+        drop(_rx2);
+
+        // Keep one live receiver so the Vec stays in the map.
+        let mut live_rx = bus.subscribe("ping").await;
+
+        // Emit — this should prune the two dead senders.
+        bus.emit(AgentEvent::new("ping", serde_json::json!(null)))
+            .await;
+
+        // The live receiver must still receive the event.
+        let event = live_rx
+            .recv()
+            .await
+            .expect("live receiver should get event");
+        assert_eq!(event.event_type, "ping");
+
+        // Verify internal Vec was pruned to exactly 1 entry.
+        let subs = bus.subscribers.read().await;
+        let len = subs.get("ping").map(|v| v.len()).unwrap_or(0);
+        assert_eq!(len, 1, "dead senders should have been pruned");
+    }
+
+    /// A concurrent `subscribe()` call must not be starved while `emit()` is
+    /// sending to its snapshot of senders.
+    #[tokio::test]
+    async fn test_event_bus_subscribe_not_starved_during_emit() {
+        use std::sync::Arc;
+        use tokio::time::{Duration, timeout};
+
+        let bus = Arc::new(EventBus::new());
+
+        // Keep a live receiver so emit() always has at least one destination
+        // and the sends don't block (channel capacity 100 > 5 emits).
+        let mut rx = bus.subscribe("ev").await;
+
+        let bus2 = bus.clone();
+        let emit_handle = tokio::spawn(async move {
+            for _ in 0u8..5 {
+                bus2.emit(AgentEvent::new("ev", serde_json::json!(null)))
+                    .await;
+            }
+        });
+
+        // subscribe() must complete well within the timeout even while
+        // emit() is running concurrently in another task.
+        let bus3 = bus.clone();
+        let subscribe_result =
+            timeout(
+                Duration::from_secs(2),
+                async move { bus3.subscribe("ev").await },
+            )
+            .await;
+
+        assert!(
+            subscribe_result.is_ok(),
+            "subscribe() was starved by emit()"
+        );
+
+        emit_handle.await.expect("failed");
+
+        // Drain so the test exits cleanly.
+        for _ in 0u8..5 {
+            let _ = rx.recv().await;
+        }
     }
 }

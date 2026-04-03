@@ -52,9 +52,11 @@
 
 use super::default::types::{ProjectRequirement, Subtask};
 use super::llm::{ChatMessage, LLMProvider, parse_llm_json};
+use mofa_kernel::agent::types::error::{GlobalError, GlobalResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 // =============================================================================
@@ -215,13 +217,13 @@ pub trait AgentProvider: Send + Sync {
 
     /// 注册新Agent（可选实现）
     /// Register new Agent (optional implementation)
-    async fn register_agent(&self, _agent: AgentInfo) -> anyhow::Result<()> {
+    async fn register_agent(&self, _agent: AgentInfo) -> GlobalResult<()> {
         Ok(())
     }
 
     /// 注销Agent（可选实现）
     /// Unregister Agent (optional implementation)
-    async fn unregister_agent(&self, _agent_id: &str) -> anyhow::Result<()> {
+    async fn unregister_agent(&self, _agent_id: &str) -> GlobalResult<()> {
         Ok(())
     }
 }
@@ -289,12 +291,12 @@ impl AgentProvider for InMemoryAgentProvider {
         }
     }
 
-    async fn register_agent(&self, agent: AgentInfo) -> anyhow::Result<()> {
+    async fn register_agent(&self, agent: AgentInfo) -> GlobalResult<()> {
         self.add_agent(agent).await;
         Ok(())
     }
 
-    async fn unregister_agent(&self, agent_id: &str) -> anyhow::Result<()> {
+    async fn unregister_agent(&self, agent_id: &str) -> GlobalResult<()> {
         self.remove_agent(agent_id).await;
         Ok(())
     }
@@ -432,7 +434,7 @@ pub trait AgentRouter: Send + Sync {
         &self,
         context: &RoutingContext,
         available_agents: &[AgentInfo],
-    ) -> anyhow::Result<RoutingDecision>;
+    ) -> GlobalResult<RoutingDecision>;
 
     /// 批量路由多个子任务
     /// Batch route multiple subtasks
@@ -440,7 +442,7 @@ pub trait AgentRouter: Send + Sync {
         &self,
         contexts: &[RoutingContext],
         available_agents: &[AgentInfo],
-    ) -> anyhow::Result<Vec<RoutingDecision>> {
+    ) -> GlobalResult<Vec<RoutingDecision>> {
         let mut results = Vec::new();
         for ctx in contexts {
             let decision = self.route(ctx, available_agents).await?;
@@ -622,9 +624,9 @@ impl AgentRouter for LLMAgentRouter {
         &self,
         context: &RoutingContext,
         available_agents: &[AgentInfo],
-    ) -> anyhow::Result<RoutingDecision> {
+    ) -> GlobalResult<RoutingDecision> {
         if available_agents.is_empty() {
-            return Err(anyhow::anyhow!("No available agents"));
+            return Err(GlobalError::Other("No available agents".to_string()));
         }
 
         // 构建消息
@@ -670,7 +672,7 @@ impl AgentRouter for LLMAgentRouter {
                 // Fallback: select the first available Agent
                 let fallback_agent = available_agents
                     .first()
-                    .ok_or_else(|| anyhow::anyhow!("No available agents"))?;
+                    .ok_or_else(|| GlobalError::Other("No available agents".to_string()))?;
 
                 Ok(RoutingDecision {
                     agent_id: fallback_agent.id.clone(),
@@ -819,6 +821,9 @@ pub struct RuleBasedRouter {
     /// 是否需要人类确认规则匹配
     /// Whether to require human confirmation on rule match
     confirm_on_match: bool,
+    /// Cache of compiled regex patterns keyed by their source string.
+    /// Avoids recompiling the same regex on every `check_condition` call.
+    regex_cache: Mutex<HashMap<String, regex::Regex>>,
 }
 
 impl RuleBasedRouter {
@@ -827,6 +832,7 @@ impl RuleBasedRouter {
             rules: Arc::new(RwLock::new(Vec::new())),
             default_agent_id: None,
             confirm_on_match: false,
+            regex_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -884,9 +890,22 @@ impl RuleBasedRouter {
             RuleOperator::NotContains => !field_value.contains(&condition.value),
             RuleOperator::StartsWith => field_value.starts_with(&condition.value),
             RuleOperator::EndsWith => field_value.ends_with(&condition.value),
-            RuleOperator::Regex => regex::Regex::new(&condition.value)
-                .map(|re| re.is_match(&field_value))
-                .unwrap_or(false),
+            RuleOperator::Regex => {
+                let cache = self.regex_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(re) = cache.get(&condition.value) {
+                    return re.is_match(&field_value);
+                }
+                drop(cache);
+                match regex::Regex::new(&condition.value) {
+                    Ok(re) => {
+                        let matched = re.is_match(&field_value);
+                        let mut cache = self.regex_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.insert(condition.value.clone(), re);
+                        matched
+                    }
+                    Err(_) => false,
+                }
+            }
             RuleOperator::In => condition.value.split(',').any(|v| v.trim() == field_value),
             RuleOperator::NotIn => !condition.value.split(',').any(|v| v.trim() == field_value),
         }
@@ -928,7 +947,7 @@ impl AgentRouter for RuleBasedRouter {
         &self,
         context: &RoutingContext,
         available_agents: &[AgentInfo],
-    ) -> anyhow::Result<RoutingDecision> {
+    ) -> GlobalResult<RoutingDecision> {
         let rules = self.rules.read().await;
 
         // 查找第一个匹配的规则
@@ -961,7 +980,7 @@ impl AgentRouter for RuleBasedRouter {
             .default_agent_id
             .clone()
             .or_else(|| available_agents.first().map(|a| a.id.clone()))
-            .ok_or_else(|| anyhow::anyhow!("No available agents"))?;
+            .ok_or_else(|| GlobalError::Other("No available agents".to_string()))?;
 
         Ok(RoutingDecision {
             agent_id,
@@ -1079,9 +1098,9 @@ impl AgentRouter for CapabilityRouter {
         &self,
         context: &RoutingContext,
         available_agents: &[AgentInfo],
-    ) -> anyhow::Result<RoutingDecision> {
+    ) -> GlobalResult<RoutingDecision> {
         if available_agents.is_empty() {
-            return Err(anyhow::anyhow!("No available agents"));
+            return Err(GlobalError::Other("No available agents".to_string()));
         }
 
         let required_caps = &context.subtask.required_capabilities;
@@ -1181,7 +1200,7 @@ impl AgentRouter for CompositeRouter {
         &self,
         context: &RoutingContext,
         available_agents: &[AgentInfo],
-    ) -> anyhow::Result<RoutingDecision> {
+    ) -> GlobalResult<RoutingDecision> {
         // 尝试每个路由器
         // Try each router
         for router in &self.routers {
@@ -1203,7 +1222,7 @@ impl AgentRouter for CompositeRouter {
         // Select first Agent by default
         let agent = available_agents
             .first()
-            .ok_or_else(|| anyhow::anyhow!("No available agents"))?;
+            .ok_or_else(|| GlobalError::Other("No available agents".to_string()))?;
 
         Ok(RoutingDecision {
             agent_id: agent.id.clone(),
@@ -1295,7 +1314,7 @@ mod tests {
             "todo_1",
         );
 
-        let decision = router.route(&context, &agents).await.unwrap();
+        let decision = router.route(&context, &agents).await.expect("failed");
         assert_eq!(decision.agent_id, "agent_1");
         assert_eq!(decision.decision_type, RoutingDecisionType::CapabilityMatch);
     }
@@ -1338,7 +1357,7 @@ mod tests {
             "todo_1",
         );
 
-        let decision = router.route(&context, &agents).await.unwrap();
+        let decision = router.route(&context, &agents).await.expect("failed");
         assert_eq!(decision.agent_id, "backend_agent");
         assert_eq!(decision.decision_type, RoutingDecisionType::RuleMatch);
     }
@@ -1369,7 +1388,7 @@ mod tests {
             "todo_1",
         );
 
-        let decision = composite.route(&context, &agents).await.unwrap();
+        let decision = composite.route(&context, &agents).await.expect("failed");
         assert_eq!(decision.agent_id, "agent_1");
     }
 }

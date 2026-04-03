@@ -73,8 +73,8 @@ enum PipelineStep {
     /// Conditional Branch
     Branch {
         condition: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-        if_true: Box<PipelineStep>,
-        if_false: Box<PipelineStep>,
+        if_true: Vec<PipelineStep>,
+        if_false: Vec<PipelineStep>,
     },
     /// 尝试恢复（如果失败则使用默认值）
     /// Try Recovery (use default value on failure)
@@ -220,31 +220,24 @@ impl Pipeline {
     where
         F: Fn(&str) -> bool + Send + Sync + 'static,
     {
-        // 将子流水线转换为单个步骤
-        // Convert sub-pipeline into a single step
-        let true_step = if if_true.steps.is_empty() {
-            PipelineStep::Identity
-        } else if if_true.steps.len() == 1 {
-            if_true.steps.into_iter().next().unwrap()
+        // Pass all sub-pipeline steps directly into the Branch variant so that
+        // all steps are executed when the condition is evaluated.
+        let true_steps = if if_true.steps.is_empty() {
+            vec![PipelineStep::Identity]
         } else {
-            // 多步骤情况，需要嵌套
-            // Multi-step case, requires nesting
-            PipelineStep::Identity // 简化处理
-                                   // Simplified handling
+            if_true.steps
         };
 
-        let false_step = if if_false.steps.is_empty() {
-            PipelineStep::Identity
-        } else if if_false.steps.len() == 1 {
-            if_false.steps.into_iter().next().unwrap()
+        let false_steps = if if_false.steps.is_empty() {
+            vec![PipelineStep::Identity]
         } else {
-            PipelineStep::Identity
+            if_false.steps
         };
 
         self.steps.push(PipelineStep::Branch {
             condition: Arc::new(condition),
-            if_true: Box::new(true_step),
-            if_false: Box::new(false_step),
+            if_true: true_steps,
+            if_false: false_steps,
         });
         self
     }
@@ -279,7 +272,7 @@ impl Pipeline {
         let mut current = input.into();
 
         for step in &self.steps {
-            current = self.execute_step(step, current).await?;
+            current = Self::execute_step(step, current).await?;
         }
 
         Ok(current)
@@ -288,7 +281,6 @@ impl Pipeline {
     /// 执行单个步骤
     /// Execute a single step
     fn execute_step<'a>(
-        &'a self,
         step: &'a PipelineStep,
         input: String,
     ) -> Pin<Box<dyn Future<Output = LLMResult<String>> + Send + 'a>> {
@@ -330,15 +322,18 @@ impl Pipeline {
                     if_true,
                     if_false,
                 } => {
-                    if condition(&input) {
-                        self.execute_step(if_true, input).await
-                    } else {
-                        self.execute_step(if_false, input).await
+                    let selected_steps = if condition(&input) { if_true } else { if_false };
+                    let mut current = input;
+
+                    for step in selected_steps {
+                        current = Self::execute_step(step, current).await?;
                     }
+
+                    Ok(current)
                 }
 
                 PipelineStep::TryRecover { step, default } => {
-                    match self.execute_step(step, input).await {
+                    match Self::execute_step(step, input).await {
                         Ok(result) => Ok(result),
                         Err(_) => Ok(default.clone()),
                     }
@@ -347,7 +342,7 @@ impl Pipeline {
                 PipelineStep::Retry { step, max_retries } => {
                     let mut last_error = None;
                     for _ in 0..=*max_retries {
-                        match self.execute_step(step, input.clone()).await {
+                        match Self::execute_step(step, input.clone()).await {
                             Ok(result) => return Ok(result),
                             Err(e) => last_error = Some(e),
                         }
@@ -598,5 +593,37 @@ mod tests {
             .map(|s| s.to_lowercase());
 
         assert_eq!(pipeline.steps.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_branch_multistep_true_runs_all_steps() {
+        let pipeline = Pipeline::new().branch(
+            |_| true,
+            Pipeline::new()
+                .map(|s| format!("{s}-A"))
+                .map(|s| format!("{s}-B")),
+            Pipeline::new()
+                .map(|s| format!("{s}-C"))
+                .map(|s| format!("{s}-D")),
+        );
+
+        let out = pipeline.run("x").await.expect("pipeline should run");
+        assert_eq!(out, "x-A-B");
+    }
+
+    #[tokio::test]
+    async fn test_branch_multistep_false_runs_all_steps() {
+        let pipeline = Pipeline::new().branch(
+            |_| false,
+            Pipeline::new()
+                .map(|s| format!("{s}-A"))
+                .map(|s| format!("{s}-B")),
+            Pipeline::new()
+                .map(|s| format!("{s}-C"))
+                .map(|s| format!("{s}-D")),
+        );
+
+        let out = pipeline.run("x").await.expect("pipeline should run");
+        assert_eq!(out, "x-C-D");
     }
 }

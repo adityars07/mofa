@@ -690,6 +690,14 @@ impl ApiCallStore for SqliteStore {
             sql.push_str(" AND model_name = ?");
             binds.push(model_name.clone());
         }
+        if let Some(start_time) = filter.start_time {
+            sql.push_str(" AND create_time >= ?");
+            binds.push(start_time.to_rfc3339());
+        }
+        if let Some(end_time) = filter.end_time {
+            sql.push_str(" AND create_time <= ?");
+            binds.push(end_time.to_rfc3339());
+        }
 
         sql.push_str(" ORDER BY create_time DESC");
 
@@ -740,6 +748,22 @@ impl ApiCallStore for SqliteStore {
         if let Some(agent_id) = filter.agent_id {
             sql.push_str(" AND agent_id = ?");
             binds.push(agent_id.to_string());
+        }
+        if let Some(status) = filter.status {
+            sql.push_str(" AND status = ?");
+            binds.push(status.to_string());
+        }
+        if let Some(ref model_name) = filter.model_name {
+            sql.push_str(" AND model_name = ?");
+            binds.push(model_name.clone());
+        }
+        if let Some(start_time) = filter.start_time {
+            sql.push_str(" AND create_time >= ?");
+            binds.push(start_time.to_rfc3339());
+        }
+        if let Some(end_time) = filter.end_time {
+            sql.push_str(" AND create_time <= ?");
+            binds.push(end_time.to_rfc3339());
         }
 
         let mut query = sqlx::query(&sql);
@@ -1343,13 +1367,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_store_messages() {
-        let store = SqliteStore::in_memory().await.unwrap();
+        let store = SqliteStore::in_memory().await.expect("failed");
         let user_id = Uuid::now_v7();
         let tenant_id = Uuid::now_v7();
         let agent_id = Uuid::now_v7();
 
         let session = ChatSession::new(user_id, agent_id).with_tenant_id(tenant_id);
-        store.create_session(&session).await.unwrap();
+        store.create_session(&session).await.expect("failed");
 
         let msg1 = LLMMessage::new(
             session.id,
@@ -1359,7 +1383,7 @@ mod tests {
             MessageRole::User,
             MessageContent::text("Hello"),
         );
-        store.save_message(&msg1).await.unwrap();
+        store.save_message(&msg1).await.expect("failed");
 
         let msg2 = LLMMessage::new(
             session.id,
@@ -1369,18 +1393,18 @@ mod tests {
             MessageRole::Assistant,
             MessageContent::text("Hi!"),
         );
-        store.save_message(&msg2).await.unwrap();
+        store.save_message(&msg2).await.expect("failed");
 
-        let messages = store.get_session_messages(session.id).await.unwrap();
+        let messages = store.get_session_messages(session.id).await.expect("failed");
         assert_eq!(messages.len(), 2);
 
-        let count = store.count_session_messages(session.id).await.unwrap();
+        let count = store.count_session_messages(session.id).await.expect("failed");
         assert_eq!(count, 2);
     }
 
     #[tokio::test]
     async fn test_sqlite_store_api_calls() {
-        let store = SqliteStore::in_memory().await.unwrap();
+        let store = SqliteStore::in_memory().await.expect("failed");
         let user_id = Uuid::now_v7();
         let tenant_id = Uuid::now_v7();
         let agent_id = Uuid::now_v7();
@@ -1401,14 +1425,82 @@ mod tests {
             now,
         );
 
-        store.save_api_call(&call).await.unwrap();
+        store.save_api_call(&call).await.expect("failed");
 
         let filter = QueryFilter::new().user(user_id);
-        let calls = store.query_api_calls(&filter).await.unwrap();
+        let calls = store.query_api_calls(&filter).await.expect("failed");
         assert_eq!(calls.len(), 1);
 
-        let stats = store.get_statistics(&filter).await.unwrap();
+        let stats = store.get_statistics(&filter).await.expect("failed");
         assert_eq!(stats.total_calls, 1);
         assert_eq!(stats.total_tokens, 150);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_store_api_calls_respects_time_range_filter() {
+        let store = SqliteStore::in_memory().await.expect("failed");
+        let user_id = Uuid::now_v7();
+        let tenant_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+
+        let now = chrono::Utc::now();
+        let old_request = now - chrono::Duration::days(2);
+        let old_response = old_request + chrono::Duration::seconds(1);
+        let old_call = LLMApiCall::success(
+            session_id,
+            agent_id,
+            user_id,
+            tenant_id,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "gpt-4",
+            10,
+            5,
+            old_request,
+            old_response,
+        );
+        store.save_api_call(&old_call).await.expect("failed");
+
+        let new_request = now - chrono::Duration::minutes(30);
+        let new_response = new_request + chrono::Duration::seconds(1);
+        let new_call = LLMApiCall::success(
+            session_id,
+            agent_id,
+            user_id,
+            tenant_id,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            "gpt-4",
+            100,
+            50,
+            new_request,
+            new_response,
+        );
+        store.save_api_call(&new_call).await.expect("failed");
+
+        let range_filter = QueryFilter::new().user(user_id).time_range(
+            now - chrono::Duration::hours(2),
+            now + chrono::Duration::minutes(1),
+        );
+
+        let calls = store.query_api_calls(&range_filter).await.expect("failed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, new_call.id);
+
+        let stats = store.get_statistics(&range_filter).await.expect("failed");
+        assert_eq!(stats.total_calls, 1);
+        assert_eq!(stats.total_tokens, 150);
+
+        let boundary_filter = QueryFilter::new()
+            .user(user_id)
+            .time_range(new_request, new_request);
+        let boundary_calls = store.query_api_calls(&boundary_filter).await.expect("failed");
+        assert_eq!(boundary_calls.len(), 1);
+        assert_eq!(boundary_calls[0].id, new_call.id);
+
+        let boundary_stats = store.get_statistics(&boundary_filter).await.expect("failed");
+        assert_eq!(boundary_stats.total_calls, 1);
+        assert_eq!(boundary_stats.total_tokens, 150);
     }
 }

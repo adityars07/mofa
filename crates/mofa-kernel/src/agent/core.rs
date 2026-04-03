@@ -549,10 +549,7 @@ impl AgentMessage {
     /// 创建新消息
     /// Create new message
     pub fn new(msg_type: impl Into<String>) -> Self {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let timestamp = crate::utils::now_ms() as i64;
 
         Self {
             msg_type: msg_type.into(),
@@ -583,5 +580,79 @@ impl AgentMessage {
     pub fn with_recipient(mut self, recipient_id: impl Into<String>) -> Self {
         self.recipient_id = recipient_id.into();
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{AgentCapabilities, AgentContext, AgentInput, AgentOutput, AgentState};
+
+    struct MinimalAgent {
+        caps: AgentCapabilities,
+    }
+
+    impl MinimalAgent {
+        fn new() -> Self {
+            Self {
+                caps: AgentCapabilities::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MoFAAgent for MinimalAgent {
+        fn id(&self) -> &str {
+            "minimal"
+        }
+
+        fn name(&self) -> &str {
+            "Minimal"
+        }
+
+        fn capabilities(&self) -> &AgentCapabilities {
+            &self.caps
+        }
+
+        async fn initialize(&mut self, _ctx: &AgentContext) -> AgentResult<()> {
+            Ok(())
+        }
+
+        async fn execute(
+            &mut self,
+            _input: AgentInput,
+            _ctx: &AgentContext,
+        ) -> AgentResult<AgentOutput> {
+            Ok(AgentOutput::text("ok"))
+        }
+
+        async fn shutdown(&mut self) -> AgentResult<()> {
+            Ok(())
+        }
+
+        fn state(&self) -> AgentState {
+            AgentState::Ready
+        }
+    }
+
+    #[tokio::test]
+    async fn default_interrupt_returns_acknowledged() {
+        let mut agent = MinimalAgent::new();
+        let res = agent.interrupt().await.expect("interrupt should succeed");
+        assert!(matches!(res, InterruptResult::Acknowledged));
+    }
+
+    #[test]
+    fn agent_message_builder_sets_fields() {
+        let msg = AgentMessage::new("event")
+            .with_content(serde_json::json!({"k":"v"}))
+            .with_sender("s1")
+            .with_recipient("r1");
+
+        assert_eq!(msg.msg_type, "event");
+        assert_eq!(msg.content, serde_json::json!({"k":"v"}));
+        assert_eq!(msg.sender_id, "s1");
+        assert_eq!(msg.recipient_id, "r1");
+        assert!(!msg.id.is_empty());
     }
 }

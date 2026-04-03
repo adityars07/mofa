@@ -212,7 +212,12 @@ impl FunctionCallingAdapter {
         self.engine
             .compile_and_cache(&self.script_id, "function_calling_script", script_content)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to compile script '{}': {}", self.script_id, e))
+            .map_err(|e| {
+                mofa_kernel::plugin::PluginError::ExecutionFailed(format!(
+                    "Failed to compile script '{}': {}",
+                    self.script_id, e
+                ))
+            })
     }
 }
 
@@ -292,7 +297,7 @@ mod tests {
             call_id: "call-1".to_string(),
         };
 
-        let result = adapter.route_tool_call(&call).await.unwrap();
+        let result = adapter.route_tool_call(&call).await.expect("failed");
         assert!(!result.success);
         assert!(result.error.is_some());
     }
@@ -320,7 +325,7 @@ mod tests {
             requires_confirmation: false,
         });
 
-        adapter.compile_script(script).await.unwrap();
+        adapter.compile_script(script).await.expect("failed");
 
         let call = ToolCall {
             name: "greet".to_string(),
@@ -328,7 +333,7 @@ mod tests {
             call_id: "call-2".to_string(),
         };
 
-        let result = adapter.route_tool_call(&call).await.unwrap();
+        let result = adapter.route_tool_call(&call).await.expect("failed");
         assert!(result.success, "expected success, got: {:?}", result.error);
         assert_eq!(result.result, serde_json::json!("Hello, World"));
     }

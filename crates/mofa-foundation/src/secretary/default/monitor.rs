@@ -2,6 +2,7 @@
 //! Task Monitor - Phase 4: Monitor feedback, push critical decisions to humans
 
 use super::types::*;
+use mofa_kernel::agent::types::error::{GlobalError, GlobalResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
@@ -258,7 +259,7 @@ impl TaskMonitor {
     pub async fn request_decision(
         &self,
         decision: CriticalDecision,
-    ) -> anyhow::Result<HumanResponse> {
+    ) -> GlobalResult<HumanResponse> {
         let decision_id = decision.id.clone();
         let (tx, mut rx) = mpsc::channel(1);
 
@@ -277,7 +278,7 @@ impl TaskMonitor {
         // Wait for human response
         rx.recv()
             .await
-            .ok_or_else(|| anyhow::anyhow!("Decision channel closed"))
+            .ok_or_else(|| GlobalError::Other("Decision channel closed".to_string()))
     }
 
     /// 提交人类响应
@@ -287,7 +288,7 @@ impl TaskMonitor {
         decision_id: &str,
         selected_option: usize,
         comment: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> GlobalResult<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -315,7 +316,7 @@ impl TaskMonitor {
             if let Some(tx) = responses.remove(decision_id) {
                 tx.send(response)
                     .await
-                    .map_err(|_| anyhow::anyhow!("Failed to send response"))?;
+                    .map_err(|_| GlobalError::Other("Failed to send response".to_string()))?;
             }
         }
 
@@ -339,7 +340,7 @@ impl TaskMonitor {
 
     /// 处理来自执行Agent的消息
     /// Handle messages from execution agents
-    pub async fn handle_agent_message(&self, message: SecretaryMessage) -> anyhow::Result<()> {
+    pub async fn handle_agent_message(&self, message: SecretaryMessage) -> GlobalResult<()> {
         match message {
             SecretaryMessage::TaskStatusReport {
                 task_id,
@@ -415,7 +416,7 @@ mod tests {
         let monitor = TaskMonitor::new();
         monitor.start_monitoring("task_1", "agent_1").await;
 
-        let snapshot = monitor.get_task_snapshot("task_1").await.unwrap();
+        let snapshot = monitor.get_task_snapshot("task_1").await.expect("failed");
         assert_eq!(snapshot.task_id, "task_1");
         assert_eq!(snapshot.agent_id, "agent_1");
     }
@@ -429,7 +430,7 @@ mod tests {
             .update_task_status("task_1", TaskExecutionStatus::Executing, 50, None)
             .await;
 
-        let snapshot = monitor.get_task_snapshot("task_1").await.unwrap();
+        let snapshot = monitor.get_task_snapshot("task_1").await.expect("failed");
         assert_eq!(snapshot.progress, 50);
     }
 
@@ -449,7 +450,7 @@ mod tests {
 
         monitor.complete_task("task_1", result).await;
 
-        let snapshot = monitor.get_task_snapshot("task_1").await.unwrap();
+        let snapshot = monitor.get_task_snapshot("task_1").await.expect("failed");
         assert!(matches!(snapshot.status, TaskExecutionStatus::Completed));
         assert_eq!(snapshot.progress, 100);
     }

@@ -1,3 +1,6 @@
+pub mod error;
+pub use error::{BusError, BusResult, IntoBusReport};
+
 use crate::agent::AgentMetadata;
 use crate::message::AgentMessage;
 use serde::{Deserialize, Serialize};
@@ -5,9 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 
+/// Default capacity for broadcast channels in the agent bus.
+const DEFAULT_BROADCAST_CHANNEL_CAPACITY: usize = 100;
+
 /// 通信模式枚举
 /// Communication mode enumeration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CommunicationMode {
     /// 点对点通信（单发送方 -> 单接收方）
     /// Point-to-point communication (Single sender -> Single receiver)
@@ -39,13 +46,13 @@ pub struct AgentBus {
 impl AgentBus {
     /// 创建通信总线实例
     /// Create a communication bus instance
-    pub async fn new() -> anyhow::Result<Self> {
-        let (broadcast_sender, _) = broadcast::channel(100);
-        Ok(Self {
+    pub fn new() -> Self {
+        let (broadcast_sender, _) = broadcast::channel(DEFAULT_BROADCAST_CHANNEL_CAPACITY);
+        Self {
             agent_channels: Arc::new(RwLock::new(HashMap::new())),
             topic_subscribers: Arc::new(RwLock::new(HashMap::new())),
             broadcast_channel: broadcast_sender,
-        })
+        }
     }
 
     /// 为智能体注册通信通道
@@ -54,7 +61,7 @@ impl AgentBus {
         &self,
         agent_metadata: &AgentMetadata,
         mode: CommunicationMode,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), BusError> {
         let id = &agent_metadata.id;
         let mut agent_channels = self.agent_channels.write().await;
         let entry = agent_channels.entry(id.clone()).or_default();
@@ -73,7 +80,7 @@ impl AgentBus {
 
         // 创建新的广播通道
         // Create a new broadcast channel
-        let (sender, _) = broadcast::channel(100);
+        let (sender, _) = broadcast::channel(DEFAULT_BROADCAST_CHANNEL_CAPACITY);
         entry.insert(mode.clone(), sender);
 
         // PubSub 模式需注册订阅者映射
@@ -96,8 +103,9 @@ impl AgentBus {
         sender_id: &str,
         mode: CommunicationMode,
         message: &AgentMessage,
-    ) -> anyhow::Result<()> {
-        let message_bytes = bincode::serialize(message)?;
+    ) -> Result<(), BusError> {
+        let message_bytes =
+            bincode::serialize(message).map_err(|e| BusError::Serialization(e.to_string()))?;
 
         match mode {
             // 点对点模式：根据接收方 ID 查找通道并发送
@@ -107,31 +115,34 @@ impl AgentBus {
                 // 1. 校验接收方是否存在并注册了对应通道
                 // 1. Verify if receiver exists and has registered the channel
                 let Some(receiver_channels) = agent_channels.get(&receiver_id) else {
-                    return Err(anyhow::anyhow!("Receiver agent {} not found", receiver_id));
+                    return Err(BusError::AgentNotRegistered(receiver_id.clone()));
                 };
                 let Some(channel) =
                     receiver_channels.get(&CommunicationMode::PointToPoint(sender_id.to_string()))
                 else {
-                    return Err(anyhow::anyhow!(
+                    return Err(BusError::ChannelNotFound(format!(
                         "Receiver {} has no point-to-point channel with sender {}",
-                        receiver_id,
-                        sender_id
-                    ));
+                        receiver_id, sender_id
+                    )));
                 };
                 // 2. 发送消息
                 // 2. Send the message
-                channel.send(message_bytes)?;
+                channel
+                    .send(message_bytes)
+                    .map_err(|e| BusError::SendFailed(e.to_string()))?;
             }
             CommunicationMode::Broadcast => {
                 // 使用全局广播通道
                 // Use the global broadcast channel
-                self.broadcast_channel.send(message_bytes)?;
+                self.broadcast_channel
+                    .send(message_bytes)
+                    .map_err(|e| BusError::SendFailed(e.to_string()))?;
             }
             CommunicationMode::PubSub(ref topic) => {
                 let topic_subs = self.topic_subscribers.read().await;
-                let subscribers = topic_subs
-                    .get(topic)
-                    .ok_or_else(|| anyhow::anyhow!("No subscribers for topic: {}", topic))?;
+                let subscribers = topic_subs.get(topic).ok_or_else(|| {
+                    BusError::ChannelNotFound(format!("No subscribers for topic: {}", topic))
+                })?;
                 let agent_channels = self.agent_channels.read().await;
 
                 for sub_id in subscribers {
@@ -141,7 +152,15 @@ impl AgentBus {
                     let Some(channel) = channels.get(&mode) else {
                         continue;
                     };
-                    channel.send(message_bytes.clone())?;
+                    if let Err(e) = channel.send(message_bytes.clone()) {
+                        tracing::warn!(
+                            subscriber = %sub_id,
+                            topic = %topic,
+                            error = %e,
+                            "PubSub: failed to deliver message to subscriber, skipping"
+                        );
+                        continue;
+                    }
                 }
             }
         }
@@ -153,37 +172,55 @@ impl AgentBus {
         &self,
         id: &str,
         mode: CommunicationMode,
-    ) -> anyhow::Result<Option<AgentMessage>> {
-        // Clone the receiver in a separate scope to ensure the read lock is dropped
-        let mut receiver = {
-            if matches!(mode, CommunicationMode::Broadcast) {
-                // 处理广播模式
-                // Handle broadcast mode
-                self.broadcast_channel.subscribe()
-            } else {
+    ) -> Result<Option<AgentMessage>, BusError> {
+        // 处理广播模式
+        // Handle broadcast mode
+        if matches!(mode, CommunicationMode::Broadcast) {
+            let mut receiver = self.broadcast_channel.subscribe();
+            match receiver.recv().await {
+                Ok(data) => {
+                    let message = bincode::deserialize(&data)
+                        .map_err(|e| BusError::Serialization(e.to_string()))?;
+                    Ok(Some(message))
+                }
+                Err(_) => Ok(None),
+            }
+        } else {
+            // 处理其他模式
+            // Handle other modes
+            let channel = {
                 let agent_channels = self.agent_channels.read().await;
-                // 处理其他模式
-                // Handle other modes
                 let Some(channels) = agent_channels.get(id) else {
                     return Ok(None);
                 };
                 let Some(channel) = channels.get(&mode) else {
                     return Ok(None);
                 };
-                channel.subscribe()
-            }
-        }; // The read lock (if acquired) is dropped here
+                channel.clone()
+            };
 
-        match receiver.recv().await {
-            Ok(data) => {
-                let message = bincode::deserialize(&data)?;
-                Ok(Some(message))
+            let mut receiver = channel.subscribe();
+            match receiver.recv().await {
+                Ok(data) => {
+                    let message = bincode::deserialize(&data)
+                        .map_err(|e| BusError::Serialization(e.to_string()))?;
+                    Ok(Some(message))
+                }
+                Err(_) => Ok(None),
             }
-            Err(_) => Ok(None),
         }
     }
 
-    pub async fn unsubscribe_topic(&self, id: &str, topic: &str) -> anyhow::Result<()> {
+    /// Subscribe to the global broadcast channel.
+    ///
+    /// Returns a `broadcast::Receiver` that will receive every message
+    /// published in `Broadcast` mode on this bus. Use this to bridge the
+    /// internal bus to external transports (WebSocket, Socket.IO, etc.).
+    pub fn subscribe_broadcast(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
+        self.broadcast_channel.subscribe()
+    }
+
+    pub async fn unsubscribe_topic(&self, id: &str, topic: &str) -> Result<(), BusError> {
         let mut topic_subs = self.topic_subscribers.write().await;
         if let Some(subscribers) = topic_subs.get_mut(topic) {
             subscribers.remove(id);
@@ -195,70 +232,139 @@ impl AgentBus {
     }
 }
 
+impl Default for AgentBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use tokio::time::timeout;
+    use crate::agent::{AgentCapabilities, AgentState};
+    use tokio::time::{Duration, sleep, timeout};
 
-    // Helper to create a dummy agent metadata
-    fn dummy_agent(id: &str) -> AgentMetadata {
+    fn test_agent_metadata(id: &str) -> AgentMetadata {
         AgentMetadata {
             id: id.to_string(),
-            name: format!("Agent {}", id),
-            description: Some("A test agent".to_string()),
+            name: id.to_string(),
+            description: None,
             version: None,
-            capabilities: Default::default(),
-            state: Default::default(),
+            capabilities: AgentCapabilities::default(),
+            state: AgentState::Ready,
         }
     }
 
     #[tokio::test]
     async fn receive_message_point_to_point_does_not_block_register_channel() {
-        let bus = AgentBus::new().await.unwrap();
-        let agent_recv = dummy_agent("recv1");
-        let agent_new = dummy_agent("new1");
-        let mode_p2p = CommunicationMode::PointToPoint("sender1".to_string());
+        let bus = AgentBus::new();
 
-        // Setup the initial channel
-        bus.register_channel(&agent_recv, mode_p2p.clone()).await.unwrap();
+        let receiver = test_agent_metadata("receiver");
+        bus.register_channel(
+            &receiver,
+            CommunicationMode::PointToPoint("sender".to_string()),
+        )
+        .await
+        .unwrap();
 
-        let bus_clone = bus.clone();
-        
-        // Spawn a task that blocks on receive_message (no sender will send)
-        let _recv_task = tokio::spawn(async move {
-            let _ = bus_clone.receive_message("recv1", mode_p2p).await;
+        let bus_for_receive = bus.clone();
+        let receive_task = tokio::spawn(async move {
+            bus_for_receive
+                .receive_message(
+                    "receiver",
+                    CommunicationMode::PointToPoint("sender".to_string()),
+                )
+                .await
         });
 
-        // Yield to let the recv_task acquire the lock and block
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Give receive_message time to subscribe and park on recv().
+        sleep(Duration::from_millis(50)).await;
 
-        // Ensure that registering a new channel does not block
-        let register_future = bus.register_channel(&agent_new, CommunicationMode::PointToPoint("sender2".to_string()));
-        let result = timeout(Duration::from_millis(200), register_future).await;
+        let writer_meta = test_agent_metadata("writer");
+        let register_res = timeout(
+            Duration::from_millis(300),
+            bus.register_channel(
+                &writer_meta,
+                CommunicationMode::PointToPoint("sender".to_string()),
+            ),
+        )
+        .await;
+        assert!(
+            register_res.is_ok(),
+            "register_channel should not be blocked by receive_message"
+        );
+        register_res.unwrap().unwrap();
 
-        assert!(result.is_ok(), "register_channel should not timeout and be blocked by receive_message");
+        bus.send_message(
+            "sender",
+            CommunicationMode::PointToPoint("receiver".to_string()),
+            &AgentMessage::TaskRequest {
+                task_id: "task-1".to_string(),
+                content: "payload".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let received = timeout(Duration::from_secs(1), receive_task)
+            .await
+            .expect("receive task timed out")
+            .expect("receive task join failed")
+            .expect("receive_message returned error");
+        assert!(
+            received.is_some(),
+            "expected one received point-to-point message"
+        );
     }
 
     #[tokio::test]
     async fn receive_message_broadcast_does_not_block_register_channel() {
-        let bus = AgentBus::new().await.unwrap();
-        let agent_new = dummy_agent("new2");
+        let bus = AgentBus::new();
 
-        let bus_clone = bus.clone();
-        
-        // Spawn a task that blocks on receive_message for Broadcast mode
-        let _recv_task = tokio::spawn(async move {
-            let _ = bus_clone.receive_message("any_id", CommunicationMode::Broadcast).await;
+        let bus_for_receive = bus.clone();
+        let receive_task = tokio::spawn(async move {
+            bus_for_receive
+                .receive_message("receiver", CommunicationMode::Broadcast)
+                .await
         });
 
-        // Yield to let the recv_task acquire the lock and block
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Give receive_message time to subscribe and park on recv().
+        sleep(Duration::from_millis(50)).await;
 
-        // Ensure that registering a new channel does not block
-        let register_future = bus.register_channel(&agent_new, CommunicationMode::PointToPoint("sender3".to_string()));
-        let result = timeout(Duration::from_millis(200), register_future).await;
+        let writer_meta = test_agent_metadata("writer");
+        let register_res = timeout(
+            Duration::from_millis(300),
+            bus.register_channel(
+                &writer_meta,
+                CommunicationMode::PointToPoint("sender".to_string()),
+            ),
+        )
+        .await;
+        assert!(
+            register_res.is_ok(),
+            "register_channel should not be blocked by broadcast receive_message"
+        );
+        register_res.unwrap().unwrap();
 
-        assert!(result.is_ok(), "register_channel should not timeout and be blocked by receive_message");
+        bus.send_message(
+            "sender",
+            CommunicationMode::Broadcast,
+            &AgentMessage::TaskRequest {
+                task_id: "task-2".to_string(),
+                content: "payload".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let received = timeout(Duration::from_secs(1), receive_task)
+            .await
+            .expect("receive task timed out")
+            .expect("receive task join failed")
+            .expect("receive_message returned error");
+        assert!(
+            received.is_some(),
+            "expected one received broadcast message"
+        );
     }
 }

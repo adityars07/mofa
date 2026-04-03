@@ -63,10 +63,17 @@ pub trait GraphState: Clone + Send + Sync + 'static {
     ///
     /// This method is called when a node returns state updates.
     /// The implementation should merge the update into the state.
-    async fn apply_update(&mut self, key: &str, value: Value) -> AgentResult<()>;
+    async fn apply_update<V: serde::Serialize + Send + Sync + 'static>(
+        &mut self,
+        key: &str,
+        value: V,
+    ) -> AgentResult<()>;
 
     /// Apply multiple updates
-    async fn apply_updates(&mut self, updates: &[StateUpdate]) -> AgentResult<()> {
+    async fn apply_updates<V: serde::Serialize + Send + Sync + 'static + Clone>(
+        &mut self,
+        updates: &[StateUpdate<V>],
+    ) -> AgentResult<()> {
         for update in updates {
             self.apply_update(&update.key, update.value.clone()).await?;
         }
@@ -76,7 +83,10 @@ pub trait GraphState: Clone + Send + Sync + 'static {
     /// Get a value by key
     ///
     /// Returns the current value for a given key, or None if the key doesn't exist.
-    fn get_value(&self, key: &str) -> Option<Value>;
+    fn get_value<V: serde::de::DeserializeOwned + Send + Sync + 'static>(
+        &self,
+        key: &str,
+    ) -> Option<V>;
 
     /// Get all keys in this state
     fn keys(&self) -> Vec<&str>;
@@ -235,13 +245,30 @@ impl JsonState {
 
 #[async_trait]
 impl GraphState for JsonState {
-    async fn apply_update(&mut self, key: &str, value: Value) -> AgentResult<()> {
-        self.data.insert(key.to_string(), value);
+    async fn apply_update<V: serde::Serialize + Send + Sync + 'static>(
+        &mut self,
+        key: &str,
+        value: V,
+    ) -> AgentResult<()> {
+        let json_value = serde_json::to_value(value)
+            .map_err(|e| crate::agent::error::AgentError::SerializationError(e.to_string()))?;
+        self.data.insert(key.to_string(), json_value);
         Ok(())
     }
 
-    fn get_value(&self, key: &str) -> Option<Value> {
-        self.data.get(key).cloned()
+    fn get_value<V: serde::de::DeserializeOwned + Send + Sync + 'static>(
+        &self,
+        key: &str,
+    ) -> Option<V> {
+        self.data.get(key).and_then(|v| {
+            match serde_json::from_value(v.clone()) {
+                Ok(val) => Some(val),
+                Err(e) => {
+                    tracing::warn!(key = key, error = %e, "GraphState::get_value deserialization failed — stored type may not match requested type");
+                    None
+                }
+            }
+        })
     }
 
     fn keys(&self) -> Vec<&str> {
@@ -266,8 +293,8 @@ mod tests {
     async fn test_json_state() {
         let mut state = JsonState::new();
 
-        state.apply_update("name", json!("test")).await.unwrap();
-        state.apply_update("count", json!(42)).await.unwrap();
+        state.apply_update("name", json!("test")).await.expect("failed");
+        state.apply_update("count", json!(42)).await.expect("failed");
 
         assert_eq!(state.get_value("name"), Some(json!("test")));
         assert_eq!(state.get_value("count"), Some(json!(42)));

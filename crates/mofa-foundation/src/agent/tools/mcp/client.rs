@@ -162,6 +162,12 @@ impl McpClient for McpClientManager {
                     "HTTP transport is not yet supported. Use Stdio transport instead.".to_string(),
                 ));
             }
+            _ => {
+                return Err(AgentError::ConfigError(format!(
+                    "Unsupported MCP transport for server '{}'",
+                    server_name
+                )));
+            }
         };
 
         tracing::info!("Connected to MCP server '{}'", server_name);
@@ -230,11 +236,7 @@ impl McpClient for McpClientManager {
 
         let params = CallToolRequestParams {
             name: tool_name.to_string().into(),
-            arguments: if arguments.is_object() {
-                Some(arguments.as_object().unwrap().clone())
-            } else {
-                Some(serde_json::Map::new())
-            },
+            arguments: Some(arguments.as_object().cloned().unwrap_or_default()),
             meta: None,
             task: None,
         };

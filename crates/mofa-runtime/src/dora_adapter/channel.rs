@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::time::timeout;
+
+/// Type alias for the receiver storage type to reduce complexity
+type ReceiverMap = Arc<RwLock<HashMap<String, Arc<Mutex<mpsc::Receiver<MessageEnvelope>>>>>>;
 
 /// 通道配置
 /// Channel configuration
@@ -140,7 +143,7 @@ pub struct DoraChannel {
     topic_channels: Arc<RwLock<HashMap<String, broadcast::Sender<MessageEnvelope>>>>,
     /// 接收器存储：智能体ID -> 接收器
     /// Receiver storage: Agent ID -> Receiver
-    receivers: Arc<RwLock<HashMap<String, mpsc::Receiver<MessageEnvelope>>>>,
+    receivers: ReceiverMap,
 }
 
 impl DoraChannel {
@@ -173,7 +176,7 @@ impl DoraChannel {
         p2p_channels.insert(agent_id.to_string(), tx);
 
         let mut receivers = self.receivers.write().await;
-        receivers.insert(agent_id.to_string(), rx);
+        receivers.insert(agent_id.to_string(), Arc::new(Mutex::new(rx)));
 
         info!(
             "Agent {} registered to channel {}",
@@ -248,11 +251,15 @@ impl DoraChannel {
             .clone()
             .ok_or_else(|| DoraError::ChannelError("No receiver specified for P2P".to_string()))?;
 
-        let p2p_channels = self.p2p_channels.read().await;
-        let tx = p2p_channels.get(&receiver_id).ok_or_else(|| {
-            DoraError::AgentNotFound(format!("Receiver {} not registered", receiver_id))
-        })?;
+        // Clone the sender in a scoped block to release lock quickly
+        let tx = {
+            let p2p_channels = self.p2p_channels.read().await;
+            p2p_channels.get(&receiver_id).cloned().ok_or_else(|| {
+                DoraError::AgentNotFound(format!("Receiver {} not registered", receiver_id))
+            })?
+        }; // Lock released here
 
+        // Send without holding any locks
         tx.send(envelope)
             .await
             .map_err(|e| DoraError::ChannelError(e.to_string()))?;
@@ -285,11 +292,16 @@ impl DoraChannel {
             .clone()
             .ok_or_else(|| DoraError::ChannelError("No topic specified".to_string()))?;
 
-        let topic_channels = self.topic_channels.read().await;
-        let tx = topic_channels
-            .get(&topic)
-            .ok_or_else(|| DoraError::ChannelError(format!("Topic {} not found", topic)))?;
+        // Clone the broadcast sender in a scoped block to release lock quickly
+        let tx = {
+            let topic_channels = self.topic_channels.read().await;
+            topic_channels
+                .get(&topic)
+                .cloned()
+                .ok_or_else(|| DoraError::ChannelError(format!("Topic {} not found", topic)))?
+        }; // Lock released here
 
+        // Send without holding any locks
         // 如果没有接收者，send 会返回错误，但这不应该是致命错误
         // If there are no receivers, send returns an error, but this shouldn't be fatal
         match tx.send(envelope) {
@@ -309,12 +321,15 @@ impl DoraChannel {
     /// 接收点对点消息（阻塞）
     /// Receive point-to-point message (blocking)
     pub async fn receive_p2p(&self, agent_id: &str) -> DoraResult<Option<MessageEnvelope>> {
-        let mut receivers = self.receivers.write().await;
-        let rx = receivers.get_mut(agent_id).ok_or_else(|| {
-            DoraError::AgentNotFound(format!("Agent {} not registered", agent_id))
-        })?;
+        let rx = {
+            let receivers = self.receivers.read().await;
+            receivers.get(agent_id).cloned().ok_or_else(|| {
+                DoraError::AgentNotFound(format!("Agent {} not registered", agent_id))
+            })?
+        };
 
-        match timeout(self.config.message_timeout, rx.recv()).await {
+        let mut rx_guard = rx.lock().await;
+        match timeout(self.config.message_timeout, rx_guard.recv()).await {
             Ok(Some(envelope)) => Ok(Some(envelope)),
             Ok(None) => Ok(None),
             Err(_) => Err(DoraError::Timeout("Receive timeout".to_string())),
@@ -324,12 +339,15 @@ impl DoraChannel {
     /// 尝试接收点对点消息（非阻塞）
     /// Try to receive point-to-point message (non-blocking)
     pub async fn try_receive_p2p(&self, agent_id: &str) -> DoraResult<Option<MessageEnvelope>> {
-        let mut receivers = self.receivers.write().await;
-        let rx = receivers.get_mut(agent_id).ok_or_else(|| {
-            DoraError::AgentNotFound(format!("Agent {} not registered", agent_id))
-        })?;
+        let rx = {
+            let receivers = self.receivers.read().await;
+            receivers.get(agent_id).cloned().ok_or_else(|| {
+                DoraError::AgentNotFound(format!("Agent {} not registered", agent_id))
+            })?
+        };
 
-        match rx.try_recv() {
+        let mut rx_guard = rx.lock().await;
+        match rx_guard.try_recv() {
             Ok(envelope) => Ok(Some(envelope)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -431,6 +449,8 @@ impl Default for ChannelManager {
 #[cfg(test)]
 mod tests {
     use super::{ChannelConfig, ChannelManager, DoraChannel, MessageEnvelope};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_p2p_communication() {
@@ -438,17 +458,17 @@ mod tests {
 
         // 注册两个智能体
         // Register two agents
-        channel.register_agent("agent1").await.unwrap();
-        channel.register_agent("agent2").await.unwrap();
+        channel.register_agent("agent1").await.expect("failed");
+        channel.register_agent("agent2").await.expect("failed");
 
         // agent1 发送消息给 agent2
         // agent1 sends message to agent2
         let envelope = MessageEnvelope::new("agent1", b"Hello agent2".to_vec()).to("agent2");
-        channel.send_p2p(envelope).await.unwrap();
+        channel.send_p2p(envelope).await.expect("failed");
 
         // agent2 接收消息
         // agent2 receives message
-        let received = channel.try_receive_p2p("agent2").await.unwrap();
+        let received = channel.try_receive_p2p("agent2").await.expect("failed");
         assert!(received.is_some());
         assert_eq!(received.unwrap().payload, b"Hello agent2");
     }
@@ -457,26 +477,26 @@ mod tests {
     async fn test_pubsub() {
         let channel = DoraChannel::new(ChannelConfig::default());
 
-        channel.register_agent("publisher").await.unwrap();
-        channel.register_agent("subscriber").await.unwrap();
+        channel.register_agent("publisher").await.expect("failed");
+        channel.register_agent("subscriber").await.expect("failed");
 
         // 订阅主题
         // Subscribe to topic
-        channel.subscribe("subscriber", "news").await.unwrap();
+        channel.subscribe("subscriber", "news").await.expect("failed");
 
         // 获取主题接收器
         // Get topic receiver
-        let mut rx = channel.subscribe_topic("news").await.unwrap();
+        let mut rx = channel.subscribe_topic("news").await.expect("failed");
 
         // 发布消息
         // Publish message
         let envelope =
             MessageEnvelope::new("publisher", b"Breaking news".to_vec()).with_topic("news");
-        channel.publish(envelope).await.unwrap();
+        channel.publish(envelope).await.expect("failed");
 
         // 接收消息
         // Receive message
-        let received = rx.recv().await.unwrap();
+        let received = rx.recv().await.expect("failed");
         assert_eq!(received.payload, b"Breaking news");
     }
 
@@ -494,5 +514,37 @@ mod tests {
         let ids = manager.channel_ids().await;
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&"channel1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_p2p_receive_deadlock() {
+        let channel = Arc::new(DoraChannel::new(ChannelConfig {
+            message_timeout: Duration::from_millis(500),
+            ..ChannelConfig::default()
+        }));
+        channel.register_agent("reader").await.expect("failed");
+        channel.register_agent("writer").await.expect("failed");
+
+        let channel_clone = channel.clone();
+
+        // start a receive on reader
+        let reader_task = tokio::spawn(async move {
+            let _ = channel_clone.receive_p2p("reader").await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start_time = std::time::Instant::now();
+
+        // registering a new agent.
+        channel.register_agent("new_agent").await.expect("failed");
+        let elapsed = start_time.elapsed();
+        reader_task.await.expect("failed");
+
+        // the bug exists if register_agent was blocked
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "Deadlock reproduced: register_agent was blocked for {:?} by receive_p2p!",
+            elapsed
+        );
     }
 }

@@ -38,9 +38,12 @@
 //! ```
 
 mod builder;
+mod execution_event;
 mod executor;
+mod fault_tolerance;
 mod graph;
 mod node;
+mod profiler;
 mod reducers;
 pub mod session_recorder;
 mod state;
@@ -67,11 +70,16 @@ pub use mofa_kernel::workflow::StateGraph;
 // Foundation-specific exports
 pub use builder::*;
 pub use dsl::*;
+pub use execution_event::{ExecutionEvent, ExecutionEventEnvelope, SCHEMA_VERSION};
 pub use executor::*;
 pub use graph::*;
+pub use mofa_kernel::workflow::policy::NodePolicy;
 pub use node::*;
+pub use profiler::*;
 pub use reducers::*;
-pub use session_recorder::InMemorySessionRecorder;
+pub use session_recorder::{
+    FileSessionRecorder, FileSessionRecorderConfig, InMemorySessionRecorder,
+};
 pub use state::*;
 pub use state_graph::{CompiledGraphImpl, StateGraphImpl};
 pub use telemetry::{ChannelTelemetryEmitter, RecordingTelemetryEmitter};
